@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Write(**)",
+      "Bash(Get-Item AGENTS.md, ROADMAP.md | Select-Object Name, Length, LastWriteTime)"
+    ]
+  }
+}
