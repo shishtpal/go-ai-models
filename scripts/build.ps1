@@ -23,12 +23,14 @@ function Write-Success {
     Write-ColorOutput $Message "Green"
 }
 
-function Write-Error {
+# Rename to avoid colliding with the built-in Write-Error cmdlet
+function Write-ErrorMsg {
     param([string]$Message)
     Write-ColorOutput $Message "Red"
 }
 
-function Write-Warning {
+# Rename to avoid colliding with the built-in Write-Warning cmdlet
+function Write-WarningMsg {
     param([string]$Message)
     Write-ColorOutput $Message "Yellow"
 }
@@ -38,11 +40,19 @@ function Write-Info {
     Write-ColorOutput $Message "Cyan"
 }
 
-# Get script directory
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ProjectRoot = Split-Path -Parent $ScriptDir
+# Get script directory — handle running from different contexts
+if ($MyInvocation.MyCommand.Path) {
+    $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $ProjectRoot = Split-Path -Parent $ScriptDir
+} else {
+    # Fallback: assume script is run from project root
+    $ProjectRoot = Get-Location
+}
+
 $BinDir = Join-Path $ProjectRoot $OutputDir
 $CmdDir = Join-Path $ProjectRoot "cmd"
+
+Write-Info "Project root: $ProjectRoot"
 
 # Clean build directory if requested
 if ($Clean) {
@@ -53,6 +63,8 @@ if ($Clean) {
     } else {
         Write-Info "Build directory does not exist, nothing to clean"
     }
+
+    # If only cleaning, exit early unless there's something else to do
 }
 
 # Create build directory
@@ -65,15 +77,44 @@ if (-not (Test-Path $BinDir)) {
 if ([string]::IsNullOrEmpty($Platform)) {
     $Platform = $env:GOOS
     if ([string]::IsNullOrEmpty($Platform)) {
-        $Platform = if ($IsWindows) { "windows" } elseif ($IsMacOS) { "darwin" } else { "linux" }
+        # $IsWindows, $IsMacOS, $IsLinux are automatic variables in PS Core (v6+)
+        # For Windows PowerShell (v5.1), these don't exist — fall back safely
+        if ($PSVersionTable.PSVersion.Major -ge 6) {
+            $Platform = if ($IsWindows) { "windows" } elseif ($IsMacOS) { "darwin" } else { "linux" }
+        } else {
+            # Windows PowerShell 5.1 only runs on Windows
+            $Platform = "windows"
+        }
     }
 }
 
 if ([string]::IsNullOrEmpty($Arch)) {
     $Arch = $env:GOARCH
     if ([string]::IsNullOrEmpty($Arch)) {
-        $Arch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+        # Check runtime architecture more reliably
+        $RuntimeArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+        $Arch = switch ($RuntimeArch) {
+            "X64"   { "amd64" }
+            "X86"   { "386" }
+            "Arm64" { "arm64" }
+            "Arm"   { "arm" }
+            default {
+                if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+            }
+        }
     }
+}
+
+# Verify Go is installed before proceeding
+try {
+    $goVersion = & go version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "go returned non-zero exit code"
+    }
+    Write-Info "Using: $goVersion"
+} catch {
+    Write-ErrorMsg "Go is not installed or not in PATH. Please install Go first."
+    exit 1
 }
 
 # Set Go environment variables
@@ -84,27 +125,75 @@ Write-Info "Building for: $Platform/$Arch"
 Write-Info "Output directory: $BinDir"
 Write-Host ""
 
-# Get all CLI tool directories
-$Tools = Get-ChildItem -Path $CmdDir -Directory | Where-Object {
-    Test-Path (Join-Path $_.FullName "main.go")
+# Build list of items to compile
+$BuildItems = [System.Collections.ArrayList]@()
+
+# Add cmd/ tools (if cmd/ directory exists)
+if (Test-Path $CmdDir) {
+    $Tools = Get-ChildItem -Path $CmdDir -Directory | Where-Object {
+        Test-Path (Join-Path $_.FullName "main.go")
+    }
+
+    foreach ($tool in $Tools) {
+        [void]$BuildItems.Add(@{
+            Name      = $tool.Name
+            # Point to the package directory, not the individual file —
+            # this lets Go resolve multi-file packages correctly
+            BuildPath = $tool.FullName
+            Type      = "cmd"
+        })
+    }
+} else {
+    Write-WarningMsg "cmd/ directory not found at $CmdDir"
 }
 
-if ($Tools.Count -eq 0) {
-    Write-Error "No CLI tools found in $CmdDir"
+# Add root main.go as catwalk
+$RootMain = Join-Path $ProjectRoot "main.go"
+if (Test-Path $RootMain) {
+    [void]$BuildItems.Add(@{
+        Name      = "catwalk"
+        BuildPath = $ProjectRoot
+        Type      = "root"
+    })
+}
+
+# Add examples (recursive search for main.go files)
+$ExamplesDir = Join-Path $ProjectRoot "examples"
+if (Test-Path $ExamplesDir) {
+    $ExampleMains = Get-ChildItem -Path $ExamplesDir -Recurse -Filter "main.go" -File
+
+    foreach ($exMain in $ExampleMains) {
+        # Get relative path from examples directory
+        $RelativePath = $exMain.Directory.FullName.Substring($ExamplesDir.Length + 1)
+        # Replace path separators with hyphens for binary name
+        $BinaryNamePart = $RelativePath -replace '[\\\/]', '-'
+
+        [void]$BuildItems.Add(@{
+            Name      = "example-$BinaryNamePart"
+            BuildPath = $exMain.Directory.FullName
+            Type      = "example"
+        })
+    }
+}
+
+if ($BuildItems.Count -eq 0) {
+    Write-ErrorMsg "No tools found to build (checked $CmdDir, root main.go, and examples/)"
     exit 1
 }
 
-Write-Info "Found $($Tools.Count) CLI tool(s) to build:"
-$Tools | ForEach-Object { Write-Host "  - $($_.Name)" }
+Write-Info "Found $($BuildItems.Count) tool(s) to build:"
+foreach ($item in $BuildItems) {
+    Write-Host "  - $($item.Name) ($($item.Type))"
+}
 Write-Host ""
 
 # Build each tool
 $SuccessCount = 0
-$FailedTools = @()
+$FailedTools = [System.Collections.ArrayList]@()
 
-foreach ($Tool in $Tools) {
-    $ToolName = $Tool.Name
-    $ToolPath = Join-Path $Tool.FullName "main.go"
+foreach ($Item in $BuildItems) {
+    $ToolName = $Item.Name
+    $BuildPath = $Item.BuildPath
 
     # Determine output binary name
     $BinaryName = if ($Platform -eq "windows") { "$ToolName.exe" } else { $ToolName }
@@ -112,54 +201,62 @@ foreach ($Tool in $Tools) {
 
     Write-Host "Building $ToolName..." -NoNewline
 
-    # Build command
+    # Build arguments as an array — avoids quoting/escaping issues with
+    # Invoke-Expression and properly handles paths with spaces
+    $goArgs = @("build", "-o", $OutputPath)
+
     if ($Verbose) {
-        $BuildCmd = "go build -v -x -o `"$OutputPath`" `"$ToolPath`""
+        $goArgs += @("-v", "-x")
         Write-Host ""
-        Write-Host "  Running: $BuildCmd" -ForegroundColor Gray
-    } else {
-        $BuildCmd = "go build -o `"$OutputPath`" `"$ToolPath`""
+        Write-Host "  Running: go $($goArgs -join ' ') `"$BuildPath`"" -ForegroundColor Gray
     }
 
-    try {
-        $BuildOutput = Invoke-Expression $BuildCmd 2>&1
+    # Use ./... pattern if pointing at a directory, or the path directly
+    $goArgs += $BuildPath
 
-        if ($LASTEXITCODE -eq 0) {
-            if (-not $Verbose) {
-                Write-Success " OK"
-            } else {
-                Write-Success " OK"
-                if ($BuildOutput) {
-                    $BuildOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+    try {
+        # Use Start-Process for reliable exit code capture, or call go directly
+        # Using & (call operator) is the idiomatic PowerShell approach
+        if ($Verbose) {
+            # Show output in real time
+            & go @goArgs 2>&1 | ForEach-Object {
+                if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                    Write-Host "  $_" -ForegroundColor Red
+                } else {
+                    Write-Host "  $_" -ForegroundColor Gray
                 }
             }
+        } else {
+            $BuildOutput = & go @goArgs 2>&1
+        }
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success " OK"
             $SuccessCount++
         } else {
-            if (-not $Verbose) {
-                Write-Error " FAILED"
-            } else {
-                Write-Error " FAILED"
+            Write-ErrorMsg " FAILED"
+            Write-ErrorMsg "  Build failed for ${ToolName}:"
+            if (-not $Verbose -and $BuildOutput) {
+                foreach ($line in $BuildOutput) {
+                    Write-Host "  $line" -ForegroundColor Red
+                }
             }
-            Write-Error "Build failed for $ToolName"
-            if ($Verbose -and $BuildOutput) {
-                $BuildOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
-            }
-            $FailedTools += $ToolName
+            [void]$FailedTools.Add($ToolName)
         }
     } catch {
-        Write-Error " FAILED"
-        Write-Error "Exception building $ToolName`: $_"
-        $FailedTools += $ToolName
+        Write-ErrorMsg " FAILED"
+        Write-ErrorMsg "  Exception building ${ToolName}: $($_.Exception.Message)"
+        [void]$FailedTools.Add($ToolName)
     }
 }
 
 Write-Host ""
 Write-Info "Build Summary:"
-Write-Host "  Total tools: $($Tools.Count)"
-Write-Success "  Successful: $SuccessCount"
+Write-Host "  Total items:  $($BuildItems.Count)"
+Write-Success "  Successful:   $SuccessCount"
 if ($FailedTools.Count -gt 0) {
-    Write-Error "  Failed: $($FailedTools.Count)"
-    Write-Error "  Failed tools: $($FailedTools -join ', ')"
+    Write-ErrorMsg "  Failed:       $($FailedTools.Count)"
+    Write-ErrorMsg "  Failed tools: $($FailedTools -join ', ')"
 }
 
 Write-Host ""
@@ -167,15 +264,19 @@ if ($FailedTools.Count -eq 0) {
     Write-Success "All CLI tools built successfully!"
     Write-Info "Binaries are located in: $BinDir"
 
-    # List built binaries
+    # List built binaries with sizes
     Write-Host ""
     Write-Info "Built binaries:"
-    Get-ChildItem -Path $BinDir -File | ForEach-Object {
-        $Size = [math]::Round($_.Length / 1KB, 2)
-        Write-Host "  $($_.Name) ($Size KB)"
+    Get-ChildItem -Path $BinDir -File | Sort-Object Name | ForEach-Object {
+        $Size = if ($_.Length -ge 1MB) {
+            "$([math]::Round($_.Length / 1MB, 2)) MB"
+        } else {
+            "$([math]::Round($_.Length / 1KB, 2)) KB"
+        }
+        Write-Host "  $($_.Name) ($Size)"
     }
     exit 0
 } else {
-    Write-Error "Build completed with errors"
+    Write-ErrorMsg "Build completed with errors"
     exit 1
 }
